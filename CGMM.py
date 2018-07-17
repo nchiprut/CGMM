@@ -5,6 +5,7 @@ import tensorflow as tf
 from scipy.special import logsumexp
 from scipy.stats import multivariate_normal as mvn
 from scipy.linalg import sqrtm
+from enum import Enum
 
 
 class Convex_GMM(object):
@@ -69,7 +70,7 @@ class Convex_GMM(object):
         self.obj_step = tf.train.AdamOptimizer().minimize(self.objective)
 
         # projection step
-        self.proj_weights, self.weights_init, self.weights_step, self.weights_stop = self.simplex_poj(self.weights)
+        self.proj_weights = self.Projection(self.Projection.ProjType.SIMPLEX, self.weights, self.bs, self.k)
 
 
     def set_params(self, means=None, covs=None):
@@ -112,10 +113,7 @@ class Convex_GMM(object):
         """
 
         self.sess.run(self.obj_step, feed_dict={self.batch: X})
-        self.sess.run(self.weights_init)
-        while self.sess.run(self.weights_stop):
-            self.sess.run(self.weights_step)
-        self.sess.run(self.proj_weights)
+        self.proj_weights.project(self.sess)
 
     def train_gdp(self, X, epoch=30000):
         for i in range(epoch):
@@ -125,42 +123,13 @@ class Convex_GMM(object):
                 print(self.sess.run(self.weights))
                 # print(self.get_params())
                 print(i)
+                """
                 for j in range(self.bs):
                     qq = tf.einsum('i,ijk->jk', tf.square(self.weights[j]), tf.einsum('ijk,ilk->ijl', self.r_covs, self.r_covs))
                     print(self.sess.run(qq))
                 print(i)
+                """
                 raise
-
-    def simplex_poj(self, X):
-        """
-        return tensor operation represents projection on simplex
-        :param X:
-        :return:
-        """
-        dual = tf.Variable(tf.truncated_normal([self.bs, 1], stddev=0.1))
-        ones = tf.constant([[1.]]*self.k)
-
-        dual_obj = -0.5*tf.reduce_sum(tf.square(tf.nn.relu(tf.matmul(dual, ones, transpose_b=True) - X)), axis=1) - \
-                   dual * (tf.reduce_sum(X,axis=1, keep_dims=True) - 1) + \
-                   0.5*self.k*tf.square(dual)
-        proj_val = tf.assign(X, tf.nn.relu(X - tf.matmul(dual, ones, transpose_b=True)))
-
-        u = tf.Variable(tf.ones([self.bs,1]))
-        l = tf.Variable(tf.ones([self.bs,1]))
-        r_max = tf.reduce_max(X,axis=1, keep_dims=True)
-        set_bounds = tf.group(
-            tf.assign(l,  r_max - 1),
-            tf.assign(u, r_max),
-            tf.assign(dual, r_max - 0.5))
-
-        pos = tf.less(tf.gradients(dual_obj, dual)[0], 0)
-        bisection_step =  tf.group(tf.assign(l, tf.where(pos, (u + l)/2, l)),
-                                   tf.assign(u, tf.where(pos, u, (u + l)/2)),
-                                   tf.assign(dual, tf.where(pos, (dual + u)/2, (dual + l)/2)))
-
-        bisection_stop = tf.reduce_all(tf.less(1e-4, u-l))
-
-        return proj_val, set_bounds, bisection_step, bisection_stop
 
     def get_params(self):
 
@@ -190,12 +159,64 @@ class Convex_GMM(object):
 
         plt.show()
 
+    class Projection(object):
+        """ Convex_GMM model
+        """
+        class ProjType(Enum):
+            SIMPLEX = 1
+            PSD = 2
+
+        def __init__(self, proj_type, X, n, d):
+            self.proj_type = proj_type
+            self.X = X
+            if self.proj_type is self.ProjType.SIMPLEX:
+                self.proj_x, self.x_init, self.opt_step, self.opt_stop = self.simplex_proj_nn(self.X, n, d)
+
+        def simplex_proj_nn(self, X, n, d):
+            """
+            return tensor operation represents projection on simplex
+            :param X:
+            :return:
+            """
+            dual = tf.Variable(tf.truncated_normal([n, 1], stddev=0.1))
+            ones = tf.constant([[1.]]*d)
+
+            dual_obj = -0.5*tf.reduce_sum(tf.square(tf.nn.relu(tf.matmul(dual, ones, transpose_b=True) - X)), axis=1) - \
+                       dual * (tf.reduce_sum(X,axis=1, keep_dims=True) - 1) + \
+                       0.5*d*tf.square(dual)
+            proj_val = tf.assign(X, tf.nn.relu(X - tf.matmul(dual, ones, transpose_b=True)))
+
+            u = tf.Variable(tf.ones([n,1]))
+            l = tf.Variable(tf.ones([n,1]))
+            r_max = tf.reduce_max(X,axis=1, keep_dims=True)
+            set_bounds = tf.group(
+                tf.assign(l,  r_max - 1),
+                tf.assign(u, r_max),
+                tf.assign(dual, r_max - 0.5))
+
+            pos = tf.less(tf.gradients(dual_obj, dual)[0], 0)
+            bisection_step =  tf.group(tf.assign(l, tf.where(pos, (u + l)/2, l)),
+                                       tf.assign(u, tf.where(pos, u, (u + l)/2)),
+                                       tf.assign(dual, tf.where(pos, (dual + u)/2, (dual + l)/2)))
+
+            bisection_stop = tf.reduce_all(tf.less(1e-4, u-l))
+
+            return proj_val, set_bounds, bisection_step, bisection_stop
+
+        def project(self, sess):
+            if self.proj_type is self.ProjType.SIMPLEX:
+                sess.run(self.x_init)
+                while sess.run(self.opt_stop):
+                    sess.run(self.opt_step)
+                sess.run(self.proj_x)
+
+
 if __name__ == "__main__":
     means = np.vstack([[0, 10], np.ones(2) * 10, np.zeros(2)])
     covs = np.vstack([np.eye(2), np.eye(2), np.eye(2)]).reshape(3, 2, 2)
 
     x = None
-    bs = 100
+    bs = 30
     dim = 2
     comp = 3
     with Convex_GMM(dim, comp, bs, 1e-1) as c:
