@@ -1,11 +1,13 @@
 import numpy as np
-np.set_printoptions(precision=2, suppress=True)
+np.set_printoptions(precision=3, suppress=True)
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from scipy.special import logsumexp
 from scipy.stats import multivariate_normal as mvn
 from scipy.linalg import sqrtm
 from enum import Enum
+import time
+from sklearn.cluster import KMeans
 
 
 class Convex_GMM(object):
@@ -14,7 +16,7 @@ class Convex_GMM(object):
 
     eps = 1e-1
 
-    def __init__(self, dimension=1, n_components=1, batch_size=200, sparsity=0.2):
+    def __init__(self, dimension=1, n_components=1, batch_size=200, step=1e-2):
 
         # samples dimension
         self.d = dimension
@@ -25,11 +27,9 @@ class Convex_GMM(object):
         # normal covariance structure
         self.bs = batch_size
 
-        # sparsity factor between (0,1)
-        self.sparsity = sparsity
-
         # input batch
         self.batch = tf.placeholder(tf.float32, [self.bs, self.d])
+
 
         #tf objects
         self.r_covs = None
@@ -38,16 +38,14 @@ class Convex_GMM(object):
         self.objective = None
         self.obj_step = None
 
-        self.build_fit_nn()
+        self.build_fit_nn(step)
         self.sess = tf.Session()
         self.sess.run(tf.global_variables_initializer())
 
-        """
-        self.means = np.zeros([self.k, self.d])
-        self.covs = np.zeros([self.k, self.d,self.d])
-        self.covs[:,np.arange(self.d),np.arange(self.d)] = 1
-        self.weights = None
-        """
+        #pgd best so far
+        # self.best_obj = float('-inf')
+        # self.best_r_covs.load(self.r_covs, self.sess)
+        # self.best_means.load(self.means, self.sess)
 
     def __enter__(self):
         return self
@@ -55,23 +53,35 @@ class Convex_GMM(object):
     def __exit__(self, type, value, traceback):
         self.sess.close()
 
-    def build_fit_nn(self):
+    def build_fit_nn(self, step):
         # optimization variables
         self.r_covs = tf.Variable(tf.truncated_normal([self.k, self.d, self.d], stddev=0.1))
         self.means = tf.Variable(tf.truncated_normal([self.k, self.d], stddev=0.1))
         self.weights = tf.Variable(np.random.dirichlet(np.ones(self.k), self.bs), dtype='float32')
 
-        self.objective = tf.constant(.0)
-        for i in range(self.bs):
-            z = self.batch[i] - tf.matmul(tf.reshape(self.weights[i], (1, -1)), self.means)
-            Q = tf.einsum('i,ijk->jk', tf.square(self.weights[i]), tf.einsum('ijk,ilk->ijl', self.r_covs, self.r_covs))
-            self.objective += tf.matmul(tf.matmul(z, tf.matrix_inverse(Q)), z, transpose_b=True) + tf.log(tf.matrix_determinant(Q))
+        # self.objective = tf.constant(.0)
 
-        self.obj_step = tf.train.AdamOptimizer().minimize(self.objective)
+        Z = self.batch - tf.matmul(self.weights, self.means)
+        Sigma = tf.einsum('ijk,ilk->ijl', self.r_covs, self.r_covs)
+        Q = tf.einsum('li,ijk->ljk', tf.square(self.weights), Sigma)
+        self.objective = tf.einsum('ji,lik,jk->', Z, tf.matrix_inverse(Q), Z) +\
+                         tf.reduce_sum(tf.log(tf.matrix_determinant(Q)))
+
+        # for i in range(self.bs):
+        #     z = self.batch[i] - tf.matmul(tf.reshape(self.weights[i], (1, -1)), self.means)
+        #     Q = tf.einsum('i,ijk->jk', tf.square(self.weights[i]), tf.einsum('ijk,ilk->ijl', self.r_covs, self.r_covs))
+        #     self.objective += tf.matmul(tf.matmul(z, tf.matrix_inverse(Q)), z, transpose_b=True) + tf.log(tf.matrix_determinant(Q))
+
+        self.obj_step = tf.train.AdamOptimizer(step).minimize(self.objective)
 
         # projection step
         self.proj_weights = self.Projection(self.Projection.ProjType.SIMPLEX, self.weights, self.bs, self.k)
 
+
+    def store_params(self):
+        self.means.load(means, self.sess)
+        self.bes_r_covs.load(self.r_covs, self.sess)
+        self.best_means.load(self.means, self.sess)
 
     def set_params(self, means=None, covs=None):
         """
@@ -84,7 +94,7 @@ class Convex_GMM(object):
         if covs is not None:
             self.r_covs.load(np.array([sqrtm(cov) for cov in covs]), self.sess)
 
-    def sample(self, n_samples=100, means=None, covs=None):
+    def sample(self, n_samples=100, means=None, covs=None, sparsity=0.2):
         """ Samples from convex combination of GM
 
         :param means: kxd array of means
@@ -101,38 +111,29 @@ class Convex_GMM(object):
         samples = np.dstack([np.random.multivariate_normal(mean, cov, n_samples)
                              for (mean, cov) in zip(means, covs)])
 
-        weights = np.random.dirichlet(np.ones(self.k)*self.sparsity, n_samples)
+        weights = np.random.dirichlet(np.ones(self.k)*sparsity, n_samples)
         weights = np.tile(weights.reshape(n_samples, 1, self.k),(1, self.d, 1))
         return np.sum(np.multiply(samples, weights), 2)
 
-    def train_step_gdp(self, X):
+    def train_step_pgd(self, X):
         """ fits data set to CGMMM model
 
         :param X: NxD array of points
         :returns: (means, covs) explains the samples as CGMM model
         """
-
         self.sess.run(self.obj_step, feed_dict={self.batch: X})
         self.proj_weights.project(self.sess)
 
-    def train_gdp(self, X, epoch=30000):
+    def train_pgd(self, X, epoch=10000):
         for i in range(epoch):
-            try:
-                self.train_step_gdp(X)
-            except:
-                print(self.sess.run(self.weights))
-                # print(self.get_params())
-                print(i)
-                """
-                for j in range(self.bs):
-                    qq = tf.einsum('i,ijk->jk', tf.square(self.weights[j]), tf.einsum('ijk,ilk->ijl', self.r_covs, self.r_covs))
-                    print(self.sess.run(qq))
-                print(i)
-                """
-                raise
+            self.train_step_pgd(X)
+            if i%1000 == 0:
+                print(self.get_params())
+
+            # if self.sess.run(self.objective, feed_dict={self.batch: X}) < self.best_obj:
+            #     self.store_params()
 
     def get_params(self):
-
         return self.sess.run([self.means, tf.einsum('ijk,ilk->ijl', self.r_covs, self.r_covs)])
 
     def visualize(self, X=None):
@@ -216,15 +217,19 @@ if __name__ == "__main__":
     covs = np.vstack([np.eye(2), np.eye(2), np.eye(2)]).reshape(3, 2, 2)
 
     x = None
-    bs = 30
+    bs = 1000
     dim = 2
     comp = 3
-    with Convex_GMM(dim, comp, bs, 1e-1) as c:
+    step = 1e-2
+    epoch = 10000
+    with Convex_GMM(dim, comp, bs, step) as c:
 
-        # for i in range(100):
+        # for i in range(500):
         x = c.sample(bs, means, covs)
-        c.train_gdp(x)
+        start = time.time()
+        c.train_pgd(x, epoch)
+        print('elapsed: ', (time.time() - start)/60)
 
-        c.visualize(x)
         print(c.get_params())
+        c.visualize(x)
 
