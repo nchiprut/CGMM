@@ -79,7 +79,6 @@ class Convex_GMM(object):
 
 
     def store_params(self):
-        self.means.load(means, self.sess)
         self.bes_r_covs.load(self.r_covs, self.sess)
         self.best_means.load(self.means, self.sess)
 
@@ -132,6 +131,10 @@ class Convex_GMM(object):
 
             # if self.sess.run(self.objective, feed_dict={self.batch: X}) < self.best_obj:
             #     self.store_params()
+
+    def init_kmeans(self, X):
+        kmeans = KMeans(n_clusters=self.k).fit(X)
+        self.means.load(kmeans.cluster_centers_, self.sess)
 
     def get_params(self):
         return self.sess.run([self.means, tf.einsum('ijk,ilk->ijl', self.r_covs, self.r_covs)])
@@ -217,7 +220,7 @@ if __name__ == "__main__":
     covs = np.vstack([np.eye(2), np.eye(2), np.eye(2)]).reshape(3, 2, 2)
 
     x = None
-    bs = 1000
+    bs = 500
     dim = 2
     comp = 3
     step = 1e-2
@@ -226,6 +229,7 @@ if __name__ == "__main__":
 
         # for i in range(500):
         x = c.sample(bs, means, covs)
+        c.init_kmeans(x)
         start = time.time()
         c.train_pgd(x, epoch)
         print('elapsed: ', (time.time() - start)/60)
